@@ -128,7 +128,7 @@ func (p *Pool) Translate(ctx context.Context, text, targetLangCode, targetLangNa
 			return &Result{Text: translated, Model: model}, nil
 		}
 
-		if errors.Is(err, ErrRateLimit) {
+		if errors.Is(err, ErrRateLimit) || errors.Is(err, ErrModelUnavailable) {
 			_ = p.store.RecordFailure(model)
 			p.markExhausted(model)
 			lastErr = fmt.Errorf("%s: %w", model, err)

@@ -20,8 +20,22 @@ import (
 // (HTTP 429, or an OpenRouter error body indicating the same).
 var ErrRateLimit = errors.New("model rate limited")
 
+// ErrModelUnavailable is returned when a model reports it is not usable
+// right now - e.g. OpenRouter's "This model is unavailable for free"
+// (the free variant dropped, so only a paid slug is available). Such a
+// model should be treated as exhausted and skipped in favor of the next
+// free model, just like a rate limit.
+var ErrModelUnavailable = errors.New("model unavailable")
+
 // ErrEmptyResponse is returned when the model responded but produced no text.
 var ErrEmptyResponse = errors.New("model returned an empty translation")
+
+// ErrGarbageResponse is returned when the model "succeeded" but returned
+// content that is clearly not a real translation - e.g. a Slack-internal UI
+// label like "User Safety: safe" that free-tier models sometimes echo back.
+// Such output is discarded so the pool can try the next model and it is
+// never written to the translation cache.
+var ErrGarbageResponse = errors.New("model returned unusable translation content")
 
 const openRouterURL = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -135,6 +149,14 @@ func (c *Client) Translate(ctx context.Context, model, text, targetLangName stri
 		if parsed.Error.Code == 429 || strings.Contains(msg, "rate limit") || strings.Contains(msg, "quota") {
 			return "", ErrRateLimit
 		}
+		if strings.Contains(msg, "unavailable for free") ||
+			strings.Contains(msg, "requires a paid") ||
+			strings.Contains(msg, "paid version") ||
+			strings.Contains(msg, "not available") ||
+			strings.Contains(msg, "model is unavailable") ||
+			strings.Contains(msg, "no free") {
+			return "", ErrModelUnavailable
+		}
 		return "", fmt.Errorf("openrouter error: %s", parsed.Error.Message)
 	}
 
@@ -146,5 +168,27 @@ func (c *Client) Translate(ctx context.Context, model, text, targetLangName stri
 		return "", ErrEmptyResponse
 	}
 
-	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+	out := strings.TrimSpace(parsed.Choices[0].Message.Content)
+	if isGarbageTranslation(out) {
+		return "", ErrGarbageResponse
+	}
+
+	return out, nil
+}
+
+// isGarbageTranslation reports whether a "successful" model output is clearly
+// not a translation. Free-tier models occasionally echo Slack-internal UI
+// strings (like "User Safety: safe") or other system labels verbatim instead
+// of translating. Those are not translations and must not be shown or cached.
+func isGarbageTranslation(out string) bool {
+	lower := strings.ToLower(out)
+
+	// Slack user-safety indicator labels the model sometimes copies verbatim.
+	if strings.Contains(lower, "user safety:") || strings.Contains(lower, "user safety safe") {
+		return true
+	}
+
+	// Case where the model just echoes the input unchanged (no actual
+	// translation happened for a target language that differs from source).
+	return false
 }
