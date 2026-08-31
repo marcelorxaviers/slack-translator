@@ -1,0 +1,7 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+slack-translator
+/bin/
+.aider*
