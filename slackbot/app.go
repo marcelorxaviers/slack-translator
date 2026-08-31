@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
@@ -21,8 +22,8 @@ import (
 type LangStore interface {
 	SetUserLang(userID, lang string) error
 	GetUserLang(userID string) (lang string, found bool, err error)
-	SaveMessage(channel, ts, originalText string) error
-	GetMessage(channel, ts string) (originalText string, found bool, err error)
+	SaveMessage(channel, ts, originalText, senderName string) error
+	GetMessage(channel, ts string) (originalText, senderName string, found bool, err error)
 }
 
 // App wires together the Slack client, the translation pool, and storage.
@@ -34,6 +35,9 @@ type App struct {
 	// BotUserID lets us ignore the bot's own messages if it ever posts
 	// non-ephemeral content into a channel.
 	botUserID string
+	// userNameCache maps Slack user IDs to their display name, so we only
+	// ask Slack for a name once per user.
+	userNameCache sync.Map
 }
 
 func New(botToken, appToken string, pool *translator.Pool, st LangStore) (*App, error) {
@@ -176,7 +180,8 @@ func (a *App) handleMessage(ctx context.Context, ev *slackevents.MessageEvent) {
 
 	// Remember the original text once, so button clicks later can rebuild
 	// any view without re-fetching from Slack.
-	if err := a.store.SaveMessage(ev.Channel, ev.TimeStamp, ev.Text); err != nil {
+	senderName := a.userName(ev.User)
+	if err := a.store.SaveMessage(ev.Channel, ev.TimeStamp, ev.Text, senderName); err != nil {
 		log.Printf("could not save original message: %v", err)
 	}
 
@@ -194,15 +199,41 @@ func (a *App) handleMessage(ctx context.Context, ev *slackevents.MessageEvent) {
 			TargetLang: lang,
 			TargetName: langName,
 		}
-		blocks := BuildTranslationBlocks(result.Text, viewTranslated, val, result.Model, result.FromCache)
+		blocks := BuildTranslationBlocks(result.Text, viewTranslated, val, result.Model, result.FromCache, senderName)
 
 		for _, user := range users {
+			// The sender attribution header below keeps the original author
+			// clear, so the ephemeral translation bubble doesn't read as a
+			// new unlabeled message that loses track of who said what.
 			_, err := a.api.PostEphemeral(ev.Channel, user, slack.MsgOptionBlocks(blocks...))
 			if err != nil {
 				log.Printf("could not post ephemeral translation to %s: %v", user, err)
 			}
 		}
 	}
+}
+
+// userName resolves a Slack user ID to a display name, caching the result so
+// we avoid repeated API calls. Falls back to the raw ID on any error.
+func (a *App) userName(userID string) string {
+	if cached, ok := a.userNameCache.Load(userID); ok {
+		return cached.(string)
+	}
+	u, err := a.api.GetUserInfo(userID)
+	if err != nil {
+		return userID
+	}
+	name := u.Name
+	if u.Profile.DisplayName != "" {
+		name = u.Profile.DisplayName
+	} else if u.Profile.RealName != "" {
+		name = u.Profile.RealName
+	}
+	if name == "" {
+		name = userID
+	}
+	a.userNameCache.Store(userID, name)
+	return name
 }
 
 // channelMembers lists human, non-deleted members of a channel.
@@ -275,7 +306,7 @@ func (a *App) handleInteraction(ctx context.Context, callback slack.InteractionC
 		return
 	}
 
-	original, found, err := a.store.GetMessage(val.Channel, val.TS)
+	original, senderName, found, err := a.store.GetMessage(val.Channel, val.TS)
 	if err != nil || !found {
 		log.Printf("could not load original message for %s/%s: %v", val.Channel, val.TS, err)
 		return
@@ -289,7 +320,7 @@ func (a *App) handleInteraction(ctx context.Context, callback slack.InteractionC
 	switch action.ActionID {
 	case "show_original":
 		targetView = viewOriginal
-		blocks = BuildTranslationBlocks(original, viewOriginal, val, "", false)
+		blocks = BuildTranslationBlocks(original, viewOriginal, val, "", false, senderName)
 
 	case "show_english":
 		targetView = viewEnglish
@@ -298,7 +329,7 @@ func (a *App) handleInteraction(ctx context.Context, callback slack.InteractionC
 			log.Printf("english translation failed: %v", err)
 			return
 		}
-		blocks = BuildTranslationBlocks(result.Text, viewEnglish, val, result.Model, result.FromCache)
+		blocks = BuildTranslationBlocks(result.Text, viewEnglish, val, result.Model, result.FromCache, senderName)
 
 	case "show_translated":
 		targetView = viewTranslated
@@ -307,7 +338,7 @@ func (a *App) handleInteraction(ctx context.Context, callback slack.InteractionC
 			log.Printf("translation failed: %v", err)
 			return
 		}
-		blocks = BuildTranslationBlocks(result.Text, viewTranslated, val, result.Model, result.FromCache)
+		blocks = BuildTranslationBlocks(result.Text, viewTranslated, val, result.Model, result.FromCache, senderName)
 
 	default:
 		return

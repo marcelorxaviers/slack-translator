@@ -74,12 +74,39 @@ func (s *Store) migrate() error {
 		channel       TEXT NOT NULL,
 		ts            TEXT NOT NULL,
 		original_text TEXT NOT NULL,
+		sender_name   TEXT NOT NULL DEFAULT '',
 		created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		PRIMARY KEY (channel, ts)
 	);
 	`
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	// Migrate: older databases created before sender_name was added.
+	cols, err := s.db.Query(`PRAGMA table_info(messages)`)
+	if err != nil {
+		return err
+	}
+	defer cols.Close()
+	hasSender := false
+	for cols.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := cols.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == "sender_name" {
+			hasSender = true
+			break
+		}
+	}
+	if !hasSender {
+		if _, err := s.db.Exec(`ALTER TABLE messages ADD COLUMN sender_name TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---------- User language preferences ----------
@@ -215,26 +242,29 @@ func (s *Store) RecordFailure(model string) error {
 // SaveMessage remembers the original text of a message keyed by channel+ts,
 // so a later button click ("View original" / "View in English") can rebuild
 // any view of it without relying on Slack API scopes to re-fetch history.
-func (s *Store) SaveMessage(channel, ts, originalText string) error {
+func (s *Store) SaveMessage(channel, ts, originalText, senderName string) error {
 	_, err := s.db.Exec(`
-		INSERT INTO messages (channel, ts, original_text)
-		VALUES (?, ?, ?)
-		ON CONFLICT(channel, ts) DO UPDATE SET original_text = excluded.original_text
-	`, channel, ts, originalText)
+		INSERT INTO messages (channel, ts, original_text, sender_name)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(channel, ts) DO UPDATE SET
+			original_text = excluded.original_text,
+			sender_name = excluded.sender_name
+	`, channel, ts, originalText, senderName)
 	return err
 }
 
-// GetMessage returns the original text of a previously saved message.
-func (s *Store) GetMessage(channel, ts string) (originalText string, found bool, err error) {
-	row := s.db.QueryRow(`SELECT original_text FROM messages WHERE channel = ? AND ts = ?`, channel, ts)
-	err = row.Scan(&originalText)
+// GetMessage returns the original text and sender name of a previously saved
+// message.
+func (s *Store) GetMessage(channel, ts string) (originalText, senderName string, found bool, err error) {
+	row := s.db.QueryRow(`SELECT original_text, sender_name FROM messages WHERE channel = ? AND ts = ?`, channel, ts)
+	err = row.Scan(&originalText, &senderName)
 	if err == sql.ErrNoRows {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
-	return originalText, true, nil
+	return originalText, senderName, true, nil
 }
 
 type ModelUsage struct {

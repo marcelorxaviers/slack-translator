@@ -50,19 +50,28 @@ func shortModelName(model string) string {
 }
 
 // BuildTranslationBlocks renders the ephemeral message shown to one
-// recipient: the text for the requested view, a small context line noting
-// the language pair and model (when relevant), and the three toggle buttons.
+// recipient: a header naming the original author, the text for the requested
+// view, a small context line noting the language pair and model (when
+// relevant), and the three toggle buttons.
 //
 // currentView controls which button is visually de-emphasized (Slack block
 // buttons don't support a true "pressed" state, so we approximate it by
 // using the "primary" style only on the buttons NOT matching the current view).
-func BuildTranslationBlocks(text string, currentView view, val actionValue, modelUsed string, fromCache bool) []slack.Block {
-	blocks := []slack.Block{
+func BuildTranslationBlocks(text string, currentView view, val actionValue, modelUsed string, fromCache bool, senderName string) []slack.Block {
+	blocks := []slack.Block{}
+
+	if currentView != viewOriginal && senderName != "" {
+		blocks = append(blocks, slack.NewContextBlock("",
+			slack.NewTextBlockObject("mrkdwn", fmt.Sprintf("*%s* said:", senderName), false, false),
+		))
+	}
+
+	blocks = append(blocks,
 		slack.NewSectionBlock(
 			slack.NewTextBlockObject("mrkdwn", text, false, false),
 			nil, nil,
 		),
-	}
+	)
 
 	if currentView != viewOriginal && modelUsed != "" {
 		cacheNote := ""
