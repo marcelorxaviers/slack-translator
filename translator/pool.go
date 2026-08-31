@@ -105,6 +105,50 @@ func (p *Pool) markExhausted(model string) {
 	_ = p.store.MarkModelExhausted(model, until)
 }
 
+// unavailableCooldown is how long a model that is confirmed no-longer-free
+// stays out of the pool before we re-check availability. Longer than the
+// daily reset: a dropped free slug would otherwise waste a request every
+// day just to rediscover it's gone.
+func unavailableCooldown() time.Time {
+	return time.Now().UTC().Add(7 * 24 * time.Hour)
+}
+
+func (p *Pool) markUnavailable(model string) {
+	until := unavailableCooldown()
+
+	p.mu.Lock()
+	p.exhausted[model] = until
+	p.mu.Unlock()
+
+	_ = p.store.MarkModelExhausted(model, until)
+}
+
+// PruneUnavailableModels fetches OpenRouter's current free-model catalog and
+// marks any configured model that is no longer on the free tier as
+// unavailable, so it is skipped without wasting a translation request.
+// Best-effort: a fetch error is non-fatal and just leaves the pool as-is.
+func (p *Pool) PruneUnavailableModels(ctx context.Context) {
+	free, err := p.client.ListFreeModels(ctx)
+	if err != nil {
+		return
+	}
+
+	// Safety: if the catalog came back essentially empty (partial/odd
+	// response), don't mark everything unavailable - that would break every
+	// model at once. Only prune when we actually have a real free list.
+	if len(free) < 3 {
+		return
+	}
+
+	for _, m := range p.models {
+		if free[m] {
+			continue
+		}
+		// Not free anymore (or unknown to the catalog): silently skip it.
+		p.markUnavailable(m)
+	}
+}
+
 // Translate returns a cached result if we've translated this exact text to
 // this language before; otherwise it walks the model list in order,
 // automatically skipping/marking exhausted models on rate limit errors,

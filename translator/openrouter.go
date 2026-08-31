@@ -37,7 +37,10 @@ var ErrEmptyResponse = errors.New("model returned an empty translation")
 // never written to the translation cache.
 var ErrGarbageResponse = errors.New("model returned unusable translation content")
 
-const openRouterURL = "https://openrouter.ai/api/v1/chat/completions"
+const (
+	openRouterURL    = "https://openrouter.ai/api/v1/chat/completions"
+	openRouterModels = "https://openrouter.ai/api/v1/models"
+)
 
 // Client is a minimal OpenRouter chat-completions client, scoped to the
 // single "translate this text" use case.
@@ -191,4 +194,52 @@ func isGarbageTranslation(out string) bool {
 	// Case where the model just echoes the input unchanged (no actual
 	// translation happened for a target language that differs from source).
 	return false
+}
+
+type modelsResponse struct {
+	Data []struct {
+		ID       string `json:"id"`
+		Pricing  struct {
+			Prompt string `json:"prompt"`
+		} `json:"pricing"`
+	} `json:"data"`
+}
+
+// ListFreeModels fetches OpenRouter's current model catalog and returns the
+// set of model IDs whose prompt pricing is free (i.e. still usable without
+// burning credits). It is used to proactively detect models that have been
+// pulled from the free tier, so the pool can skip them before wasting a
+// translation request. The `openrouter/free` router is always treated as
+// available since it re-routes to whatever free model exists.
+func (c *Client) ListFreeModels(ctx context.Context) (map[string]bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, openRouterModels, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build models request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("models request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("openrouter models http %d", resp.StatusCode)
+	}
+
+	var parsed modelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, fmt.Errorf("parse models response: %w", err)
+	}
+
+	free := make(map[string]bool)
+	for _, m := range parsed.Data {
+		if m.Pricing.Prompt == "0" {
+			free[m.ID] = true
+		}
+	}
+	free["openrouter/free"] = true
+	return free, nil
 }
