@@ -5,3 +5,4 @@
 slack-translator
 /bin/
 .aider*
+.DS_Store
